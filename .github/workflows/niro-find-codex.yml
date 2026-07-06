@@ -1,0 +1,59 @@
+name: Niro Find (Codex)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: niro-find-codex-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  find:
+    name: Pentest and report findings
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      NIRO_AGENT: codex
+      NIRO_CONFIG_DIR: niro
+      NIRO_GOAL: "Pentest this application"
+      NIRO_CI_ARTIFACT_INCLUDE_FINDINGS: "true"
+      NIRO_CI_ARTIFACT_UPLOAD_DEBUG_LOGS: "true"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Niro CI
+        shell: bash
+        run: curl -fsSL https://raw.githubusercontent.com/apxlabs-ai/niro/main/install-ci.sh | sh
+
+      - name: Run Niro
+        shell: bash
+        env:
+          CODEX_AUTH_JSON_B64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: niro-ci find
+
+      - name: Upload Niro knowledge
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: niro-knowledge
+          path: niro-knowledge.tar
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload debug logs
+        if: always() && contains(fromJSON('["true","TRUE","1","yes","YES","on","ON"]'), env.NIRO_CI_ARTIFACT_UPLOAD_DEBUG_LOGS)
+        uses: actions/upload-artifact@v7
+        with:
+          name: niro-debug-logs-unsafe
+          path: niro-debug-artifacts/**
+          if-no-files-found: ignore
+          retention-days: 7
