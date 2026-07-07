@@ -13,7 +13,7 @@ concurrency:
 jobs:
   find:
     name: Pentest and report findings
-    runs-on: ubuntu-latest
+    runs-on: openobserve-runner
     timeout-minutes: 300
 
     env:
