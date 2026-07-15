@@ -128,14 +128,13 @@ pub async fn traces_write(
         .get("Content-Type")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("application/json");
-    let org_id = if let Some(Some(v)) = headers
-        .get(&cfg.grpc.org_header_key)
-        .map(|header| header.to_str().ok())
+    if let Some(header_org_id) = headers.get(&cfg.grpc.org_header_key)
+        && header_org_id.to_str().ok() != Some(org_id.as_str())
     {
-        v.to_string()
-    } else {
-        org_id
-    };
+        return MetaHttpResponse::forbidden(
+            "Organization header must match the authenticated route organization",
+        );
+    }
     let in_stream_name = headers
         .get(&cfg.grpc.stream_header_key)
         .and_then(|header| header.to_str().ok());
@@ -1988,6 +1987,53 @@ struct TraceServiceNameItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_trace_ingestion_rejects_conflicting_organization_header() {
+        let cfg = get_config();
+        let user = Headers(UserEmail {
+            user_id: "admin-b@example.com".to_string(),
+        });
+        let body = Bytes::from_static(br#"{"resourceSpans":[]}"#);
+
+        let mut matching_headers = HeaderMap::new();
+        matching_headers.insert("content-type", "application/json".parse().unwrap());
+        matching_headers.insert(
+            cfg.grpc.org_header_key.parse::<http::HeaderName>().unwrap(),
+            "org-b".parse().expect("valid matching organization header"),
+        );
+        let matching = traces_write(
+            Path("org-b".to_string()),
+            user,
+            matching_headers,
+            body.clone(),
+        )
+        .await;
+        assert_ne!(
+            matching.status(),
+            http::StatusCode::FORBIDDEN,
+            "a matching organization header is a legitimate ingestion request"
+        );
+
+        let mut conflicting_headers = HeaderMap::new();
+        conflicting_headers.insert("content-type", "application/json".parse().unwrap());
+        conflicting_headers.insert(
+            cfg.grpc.org_header_key.parse::<http::HeaderName>().unwrap(),
+            "org-a"
+                .parse()
+                .expect("valid conflicting organization header"),
+        );
+        let conflicting = traces_write(
+            Path("org-b".to_string()),
+            Headers(UserEmail {
+                user_id: "admin-b@example.com".to_string(),
+            }),
+            conflicting_headers,
+            body,
+        )
+        .await;
+        assert_eq!(conflicting.status(), http::StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn test_trace_service_name_item_default() {
