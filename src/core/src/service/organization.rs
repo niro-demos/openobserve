@@ -335,6 +335,25 @@ async fn update_passcode_inner(
         return Err(anyhow::Error::msg("User not found"));
     };
 
+    if is_service_account {
+        let Some(org_id) = org_id else {
+            return Err(anyhow::Error::msg(
+                "Service account organization is required",
+            ));
+        };
+        let Some(owner) = db_user.organizations.iter().find(|org| org.name == org_id) else {
+            return Err(anyhow::Error::msg("User not found"));
+        };
+        if owner.role != UserRole::ServiceAccount {
+            return Err(anyhow::Error::msg("Target is not a service account"));
+        }
+        if db_user.is_external {
+            return Err(anyhow::Error::msg(
+                "Not allowed for external service accounts",
+            ));
+        }
+    }
+
     if let Some(org_id) = org_id {
         local_org_id = org_id;
     }
@@ -351,7 +370,10 @@ async fn update_passcode_inner(
             return Err(anyhow::Error::msg("User not found"));
         }
         let org_to_update = orgs[0];
-        if org_to_update.role.eq(&UserRole::ServiceAccount) && db_user.is_external {
+        if !is_service_account
+            && org_to_update.role.eq(&UserRole::ServiceAccount)
+            && db_user.is_external
+        {
             return Err(anyhow::Error::msg(
                 "Not allowed for external service accounts",
             ));

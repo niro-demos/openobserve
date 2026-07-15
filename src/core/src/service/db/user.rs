@@ -151,9 +151,16 @@ pub async fn get_db_user(name: &str) -> Result<DBUser, anyhow::Error> {
 pub async fn add(db_user: &DBUser) -> Result<(), anyhow::Error> {
     let key = format!("{USER_RECORD_KEY}{}", db_user.email);
     let user = users::UserRecord::from(db_user);
-    users::add(user.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("Error adding user: {e}"))?;
+    let is_service_account = db_user
+        .organizations
+        .iter()
+        .any(|org| org.role == UserRole::ServiceAccount);
+    let add_result = if is_service_account {
+        users::add_exclusive(user.clone()).await
+    } else {
+        users::add(user.clone()).await
+    };
+    add_result.map_err(|e| anyhow::anyhow!("Error adding user: {e}"))?;
     let _ = put_into_db_coordinator(&key, Bytes::new(), true, None).await;
 
     // Add user to orgs

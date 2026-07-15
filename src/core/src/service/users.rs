@@ -145,6 +145,17 @@ pub async fn post_user(
         ));
     }
 
+    if usr_req.role.base_role == UserRole::ServiceAccount
+        && let Ok(existing) = db::user::get_db_user(&usr_req.email).await
+    {
+        if existing.organizations.iter().any(|org| org.name != org_id) {
+            return Ok(MetaHttpResponse::conflict(
+                "Service account identity is already owned by another organization",
+            ));
+        }
+        return Ok(MetaHttpResponse::bad_request("User already exists"));
+    }
+
     if is_allowed {
         let existing_user = if is_root_user(&usr_req.email) {
             db::user::get(None, &usr_req.email).await
@@ -340,6 +351,23 @@ pub async fn update_user(
                                 return Ok(MetaHttpResponse::unauthorized("Not Allowed"));
                             }
                         };
+                        #[cfg(not(feature = "enterprise"))]
+                        if initiating_user.role != UserRole::Admin
+                            && initiating_user.role != UserRole::Root
+                        {
+                            return Ok(MetaHttpResponse::forbidden(
+                                "Admin or Root role required to update another user",
+                            ));
+                        }
+                        #[cfg(feature = "enterprise")]
+                        if !o2_openfga::config::get_config().enabled
+                            && initiating_user.role != UserRole::Admin
+                            && initiating_user.role != UserRole::Root
+                        {
+                            return Ok(MetaHttpResponse::forbidden(
+                                "Admin or Root role required to update another user",
+                            ));
+                        }
                         if (local_user.role.eq(&UserRole::Root)
                             && initiating_user.role.eq(&UserRole::Root))
                             || (!local_user.role.eq(&UserRole::Root)
@@ -1743,6 +1771,149 @@ mod tests {
         assert!(resp.is_ok());
         let response = resp.unwrap();
         assert_eq!(response.status(), 400);
+    }
+
+    fn service_account_request(email: &str) -> UserRequest {
+        UserRequest {
+            email: email.to_string(),
+            password: String::new(),
+            role: UserOrgRole {
+                base_role: UserRole::ServiceAccount,
+                custom_role: None,
+            },
+            first_name: "Service".to_string(),
+            last_name: "Account".to_string(),
+            is_external: false,
+            token: None,
+        }
+    }
+
+    fn identity_update(first_name: &str) -> UpdateUser {
+        UpdateUser {
+            token: None,
+            first_name: Some(first_name.to_string()),
+            last_name: Some("Account".to_string()),
+            old_password: None,
+            new_password: None,
+            role: None,
+            change_password: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn service_account_rotation_rejects_non_service_account_targets() {
+        set_up().await;
+        create_new_user(DBUser {
+            email: "admin@zo.dev".to_string(),
+            password: "password".to_string(),
+            salt: "salt".to_string(),
+            first_name: "Admin".to_string(),
+            last_name: "User".to_string(),
+            password_ext: None,
+            is_external: false,
+            organizations: vec![UserOrg {
+                name: "dummy".to_string(),
+                org_name: "dummy".to_string(),
+                token: "admin-token".to_string(),
+                rum_token: Some("admin-rum".to_string()),
+                role: UserRole::Admin,
+            }],
+        })
+        .await
+        .unwrap();
+
+        let created = post_user(
+            "dummy",
+            service_account_request("rotation-control@zo.dev"),
+            "admin@zo.dev",
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), http::StatusCode::OK);
+        assert!(
+            organization::update_service_account_passcode(Some("dummy"), "rotation-control@zo.dev")
+                .await
+                .is_ok(),
+            "legitimate service-account rotation must remain available"
+        );
+
+        assert!(
+            organization::update_service_account_passcode(Some("dummy"), "admin@zo.dev")
+                .await
+                .is_err(),
+            "non-service-account targets must not be accepted by service-account rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_accounts_can_update_self_but_not_peer_identity() {
+        set_up().await;
+        for email in ["attacker@zo.dev", "victim@zo.dev"] {
+            let created = post_user("dummy", service_account_request(email), "admin@zo.dev")
+                .await
+                .unwrap();
+            assert_eq!(created.status(), http::StatusCode::OK);
+        }
+
+        let self_update = update_user(
+            "dummy",
+            "attacker@zo.dev",
+            UserUpdateMode::SelfUpdate,
+            "attacker@zo.dev",
+            identity_update("SelfUpdated"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(self_update.status(), http::StatusCode::OK);
+
+        let peer_update = update_user(
+            "dummy",
+            "victim@zo.dev",
+            UserUpdateMode::OtherUpdate,
+            "attacker@zo.dev",
+            identity_update("PeerChanged"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer_update.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_account_identity_has_one_owning_organization() {
+        set_up().await;
+        organization::check_and_create_org_without_ofga("other")
+            .await
+            .unwrap();
+        ORG_USERS.insert(
+            "other/admin@zo.dev".to_string(),
+            OrgUserRecord {
+                role: UserRole::Admin,
+                token: "other-token".to_string(),
+                rum_token: Some("other-rum".to_string()),
+                org_id: "other".to_string(),
+                email: "admin@zo.dev".to_string(),
+                created_at: 0,
+                allow_static_token: true,
+            },
+        );
+
+        let first = post_user(
+            "dummy",
+            service_account_request("single-owner@zo.dev"),
+            "admin@zo.dev",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), http::StatusCode::OK);
+
+        let second = post_user(
+            "other",
+            service_account_request("single-owner@zo.dev"),
+            "admin@zo.dev",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status(), http::StatusCode::CONFLICT);
     }
 
     #[tokio::test]
