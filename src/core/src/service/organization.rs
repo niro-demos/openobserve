@@ -222,6 +222,16 @@ async fn get_passcode_inner(
     is_service_account: bool,
 ) -> Result<IngestionPasscode, anyhow::Error> {
     let lookup_org_id = org_id.unwrap_or(DEFAULT_ORG);
+    let Ok(Some(user)) = db::user::get(org_id, user_id).await else {
+        return Err(anyhow::Error::msg("User not found"));
+    };
+    let is_service_account = is_service_account || user.role.is_service_account();
+
+    if is_service_account && user.is_external {
+        return Err(anyhow::Error::msg(
+            "Not allowed for external service accounts",
+        ));
+    }
 
     // The org-wide "default" ingestion token is only the right answer for the
     // org ingestion passcode — never for a service account, which must return
@@ -242,15 +252,7 @@ async fn get_passcode_inner(
         }
     }
 
-    // Fall back to existing user token lookup
-    let Ok(Some(user)) = db::user::get(org_id, user_id).await else {
-        return Err(anyhow::Error::msg("User not found"));
-    };
-    if user.role.eq(&UserRole::ServiceAccount) && user.is_external {
-        return Err(anyhow::Error::msg(
-            "Not allowed for external service accounts",
-        ));
-    }
+    // Fall back to the user's own token.
     let passcode = mask_token_if_needed(user.token, org_id, &user.email);
     Ok(IngestionPasscode {
         user: user.email,
@@ -328,12 +330,31 @@ async fn update_passcode_inner(
     org_id: Option<&str>,
     user_id: &str,
     is_rum_update: bool,
-    is_service_account: bool,
+    mut is_service_account: bool,
 ) -> Result<IngestionTokensContainer, anyhow::Error> {
     let mut local_org_id = "";
     let Ok(db_user) = db::user::get_db_user(user_id).await else {
         return Err(anyhow::Error::msg("User not found"));
     };
+
+    if is_service_account {
+        let Some(org_id) = org_id else {
+            return Err(anyhow::Error::msg(
+                "Service account organization is required",
+            ));
+        };
+        let Some(owner) = db_user.organizations.iter().find(|org| org.name == org_id) else {
+            return Err(anyhow::Error::msg("User not found"));
+        };
+        if owner.role != UserRole::ServiceAccount {
+            return Err(anyhow::Error::msg("Target is not a service account"));
+        }
+        if db_user.is_external {
+            return Err(anyhow::Error::msg(
+                "Not allowed for external service accounts",
+            ));
+        }
+    }
 
     if let Some(org_id) = org_id {
         local_org_id = org_id;
@@ -351,7 +372,8 @@ async fn update_passcode_inner(
             return Err(anyhow::Error::msg("User not found"));
         }
         let org_to_update = orgs[0];
-        if org_to_update.role.eq(&UserRole::ServiceAccount) && db_user.is_external {
+        is_service_account |= org_to_update.role.is_service_account();
+        if is_service_account && db_user.is_external {
             return Err(anyhow::Error::msg(
                 "Not allowed for external service accounts",
             ));
@@ -1320,7 +1342,9 @@ pub async fn get_sre_agent_credentials(org_id: &str) -> Result<(String, String),
 
 #[cfg(test)]
 mod tests {
+    use config::meta::user::{DBUser, UserOrg};
     use infra::{db as infra_db, table as infra_table};
+    use sea_orm::{ConnectionTrait, Statement};
 
     use super::*;
     use crate::{common::meta::user::UserRequest, service::users};
@@ -1403,6 +1427,122 @@ mod tests {
         assert!(should_use_org_ingestion_token(false, true));
         // …and falls back to the user token when no org token exists.
         assert!(!should_use_org_ingestion_token(false, false));
+    }
+
+    #[tokio::test]
+    async fn test_generic_passcode_keeps_service_account_credentials_isolated() {
+        let _ = infra_db::create_table().await;
+        let _ = infra_table::create_user_tables().await;
+        let client = infra::db::ORM_CLIENT
+            .get_or_init(infra::db::connect_to_orm)
+            .await;
+        client
+            .execute(Statement::from_string(
+                client.get_database_backend(),
+                "CREATE TABLE IF NOT EXISTS org_ingestion_tokens (id VARCHAR(256) PRIMARY KEY NOT NULL, org_id VARCHAR(100) NOT NULL, name VARCHAR(256) NOT NULL, token VARCHAR(256) NOT NULL, description TEXT, is_default BOOLEAN NOT NULL DEFAULT FALSE, enabled BOOLEAN NOT NULL DEFAULT TRUE, created_by VARCHAR(256) NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let suffix = config::ider::uuid();
+        let org_id = format!("passcode-isolation-{suffix}");
+        let service_email = format!("service-{suffix}@example.com");
+        let admin_email = format!("admin-{suffix}@example.com");
+        let service_token = "revocable-service-token";
+        let admin_token = "admin-token";
+
+        let now = chrono::Utc::now().timestamp_micros();
+        let org_token = format!("o2oi_{suffix}");
+        infra_table::organizations::add(
+            &org_id,
+            &org_id,
+            config::meta::organization::OrganizationType::Custom,
+        )
+        .await
+        .unwrap();
+        db::org_ingestion_tokens::add(
+            &infra::table::org_ingestion_tokens::OrgIngestionTokenRecord {
+                id: suffix.clone(),
+                org_id: org_id.clone(),
+                name: "default".to_string(),
+                token: org_token,
+                description: String::new(),
+                is_default: true,
+                enabled: true,
+                created_by: admin_email.clone(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        for (email, role, token) in [
+            (&service_email, UserRole::ServiceAccount, service_token),
+            (&admin_email, UserRole::Admin, admin_token),
+        ] {
+            db::user::add(&DBUser {
+                email: email.to_string(),
+                first_name: String::new(),
+                last_name: String::new(),
+                password: "unused".to_string(),
+                salt: String::new(),
+                organizations: vec![UserOrg {
+                    name: org_id.clone(),
+                    org_name: org_id.clone(),
+                    token: token.to_string(),
+                    rum_token: None,
+                    role,
+                }],
+                is_external: false,
+                password_ext: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let org_token_before = db::org_ingestion_tokens::get_by_name(&org_id, "default")
+            .await
+            .unwrap()
+            .unwrap()
+            .token;
+
+        // Healthy control: a normal administrator keeps the org-level passcode behavior.
+        assert_eq!(
+            get_passcode(Some(&org_id), &admin_email)
+                .await
+                .unwrap()
+                .passcode,
+            org_token_before
+        );
+
+        // Security invariant: generic routes must infer service-account status from
+        // membership and never disclose or rotate the organization credential.
+        assert_eq!(
+            get_passcode(Some(&org_id), &service_email)
+                .await
+                .unwrap()
+                .passcode,
+            service_token
+        );
+        let rotated = update_passcode(Some(&org_id), &service_email)
+            .await
+            .unwrap();
+        assert_ne!(rotated.passcode, service_token);
+        assert_eq!(
+            db::org_ingestion_tokens::get_by_name(&org_id, "default")
+                .await
+                .unwrap()
+                .unwrap()
+                .token,
+            org_token_before
+        );
+        assert_eq!(
+            db::org_users::get(&org_id, &service_email)
+                .await
+                .unwrap()
+                .token,
+            rotated.passcode
+        );
     }
 
     #[test]

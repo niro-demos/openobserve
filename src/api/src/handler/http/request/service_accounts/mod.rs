@@ -293,16 +293,13 @@ pub async fn update(
         token: None,
     };
     let initiator_id = &user_email.user_id;
+    let update_mode = if email_id == *initiator_id {
+        UserUpdateMode::SelfUpdate
+    } else {
+        UserUpdateMode::OtherUpdate
+    };
 
-    match users::update_user(
-        &org_id,
-        &email_id,
-        UserUpdateMode::OtherUpdate,
-        initiator_id,
-        user,
-    )
-    .await
-    {
+    match users::update_user(&org_id, &email_id, update_mode, initiator_id, user).await {
         Ok(resp) => resp,
         Err(e) => MetaHttpResponse::internal_error(e),
     }

@@ -131,7 +131,7 @@ pub async fn create_table() -> Result<(), errors::Error> {
     Ok(())
 }
 
-pub async fn add(user: UserRecord) -> Result<(), errors::Error> {
+async fn add_inner(user: UserRecord, allow_existing: bool) -> Result<(), errors::Error> {
     let now = chrono::Utc::now().timestamp_micros();
     let record = ActiveModel {
         email: Set(user.email),
@@ -154,10 +154,23 @@ pub async fn add(user: UserRecord) -> Result<(), errors::Error> {
     match Entity::insert(record).exec(client).await {
         Ok(_) => Ok(()),
         Err(e) => match e.sql_err() {
-            Some(SqlErr::UniqueConstraintViolation(_)) => Ok(()),
+            Some(SqlErr::UniqueConstraintViolation(_)) if allow_existing => Ok(()),
             _ => Err(Error::DbError(DbError::SeaORMError(e.to_string()))),
         },
     }
+}
+
+pub async fn add(user: UserRecord) -> Result<(), errors::Error> {
+    add_inner(user, true).await
+}
+
+/// Claim a globally unique user identity.
+///
+/// Unlike [`add`], this reports an existing email as an error. Service-account
+/// creation uses this as the atomic ownership claim so two organizations cannot
+/// concurrently attach the same machine identity.
+pub async fn add_exclusive(user: UserRecord) -> Result<(), errors::Error> {
+    add_inner(user, false).await
 }
 
 pub async fn update(
