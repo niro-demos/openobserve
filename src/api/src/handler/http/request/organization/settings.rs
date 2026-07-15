@@ -27,12 +27,16 @@ use {
 };
 
 use crate::{
-    common::meta::{
-        http::HttpResponse as MetaHttpResponse,
-        organization::{
-            OrganizationSetting, OrganizationSettingPayload, OrganizationSettingResponse,
+    common::{
+        meta::{
+            http::HttpResponse as MetaHttpResponse,
+            organization::{
+                OrganizationSetting, OrganizationSettingPayload, OrganizationSettingResponse,
+            },
         },
+        utils::auth::UserEmail,
     },
+    handler::http::extractors::Headers,
     service::db::organization::{get_org_setting, set_org_setting},
 };
 
@@ -66,8 +70,23 @@ use crate::{
 )]
 pub async fn create(
     Path(org_id): Path<String>,
+    Headers(user_email): Headers<UserEmail>,
     Json(settings): Json<OrganizationSettingPayload>,
 ) -> Response {
+    if !crate::service::authz::authorize_admin_operation(
+        &org_id,
+        &user_email.user_id,
+        "POST",
+        "settings",
+        &org_id,
+    )
+    .await
+    {
+        return MetaHttpResponse::forbidden(
+            "Admin or Root role required to update organization settings",
+        );
+    }
+
     let mut data = match get_org_setting(&org_id).await {
         Ok(data) => data,
         Err(err) => {

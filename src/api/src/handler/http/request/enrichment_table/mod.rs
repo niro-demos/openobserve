@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    common::meta::http::HttpResponse as MetaHttpResponse,
+    common::{meta::http::HttpResponse as MetaHttpResponse, utils::auth::UserEmail},
+    handler::http::extractors::Headers,
     service::enrichment_table::{extract_multipart, save_enrichment_data},
 };
 
@@ -57,10 +58,23 @@ use crate::{
 )]
 pub async fn save_enrichment_table(
     Path((org_id, table_name)): Path<(String, String)>,
+    Headers(user_email): Headers<UserEmail>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     payload: Multipart,
 ) -> Response {
+    if !crate::service::authz::authorize_admin_operation(
+        &org_id,
+        &user_email.user_id,
+        "POST",
+        "enrichment_tables",
+        &table_name,
+    )
+    .await
+    {
+        return MetaHttpResponse::forbidden("Unauthorized Access");
+    }
+
     let bad_req_msg = if org_id.trim().is_empty() {
         Some("Organization cannot be empty")
     } else if table_name.trim().is_empty() {

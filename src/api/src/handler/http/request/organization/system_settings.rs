@@ -28,7 +28,11 @@ use config::meta::system_settings::{
     SettingScope, SystemSetting, SystemSettingPayload, SystemSettingQuery,
 };
 
-use crate::{common::meta::http::HttpResponse as MetaHttpResponse, service::db::system_settings};
+use crate::{
+    common::{meta::http::HttpResponse as MetaHttpResponse, utils::auth::UserEmail},
+    handler::http::extractors::Headers,
+    service::db::system_settings,
+};
 
 /// Get a specific system setting with resolution (user -> org -> system)
 #[utoipa::path(
@@ -183,8 +187,22 @@ pub async fn set_org_setting(
 )]
 pub async fn set_user_setting(
     Path((org_id, user_id)): Path<(String, String)>,
+    Headers(caller): Headers<UserEmail>,
     Json(payload): Json<SystemSettingPayload>,
 ) -> Response {
+    if caller.user_id != user_id
+        && !crate::service::authz::authorize_admin_operation(
+            &org_id,
+            &caller.user_id,
+            "POST",
+            "user_settings",
+            &user_id,
+        )
+        .await
+    {
+        return MetaHttpResponse::forbidden("Unauthorized Access");
+    }
+
     let mut setting = SystemSetting::new_user(
         &org_id,
         &user_id,
@@ -269,7 +287,21 @@ pub async fn delete_org_setting(Path((org_id, key)): Path<(String, String)>) -> 
 )]
 pub async fn delete_user_setting(
     Path((org_id, user_id, key)): Path<(String, String, String)>,
+    Headers(caller): Headers<UserEmail>,
 ) -> Response {
+    if caller.user_id != user_id
+        && !crate::service::authz::authorize_admin_operation(
+            &org_id,
+            &caller.user_id,
+            "DELETE",
+            "user_settings",
+            &user_id,
+        )
+        .await
+    {
+        return MetaHttpResponse::forbidden("Unauthorized Access");
+    }
+
     match system_settings::delete(&SettingScope::User, Some(&org_id), Some(&user_id), &key).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
         Ok(false) => MetaHttpResponse::not_found("Setting not found"),

@@ -15,9 +15,7 @@
 
 use config::meta::user::UserRole;
 
-use crate::common::utils::auth::AuthExtractor;
-#[cfg(feature = "enterprise")]
-use crate::common::utils::auth::is_root_user;
+use crate::common::utils::auth::{AuthExtractor, is_root_user};
 
 #[cfg(feature = "enterprise")]
 pub async fn check_permissions(
@@ -75,7 +73,57 @@ pub async fn check_permissions(
     _role: UserRole,
     _is_external: bool,
 ) -> bool {
-    true
+    if _auth_info.bypass_check {
+        return true;
+    }
+
+    let administrative_operation = matches!(
+        (_auth_info.method.as_str(), _auth_info.o2_type.as_str()),
+        ("POST", "enrichment_tables")
+            | ("GET", "users")
+            | ("DELETE", "streams")
+            | ("POST", "user_settings")
+            | ("DELETE", "user_settings")
+            | ("POST", "settings")
+    );
+
+    !administrative_operation || matches!(_role, UserRole::Admin | UserRole::Root)
+}
+
+/// Authorize an organization-level administrative operation using the edition's
+/// normal authorization model. Community edition has no delegated grants, so
+/// only Admin and Root roles satisfy sensitive operations; enterprise delegates
+/// the decision to OpenFGA through `check_permissions`.
+pub async fn authorize_admin_operation(
+    org_id: &str,
+    user_id: &str,
+    method: &str,
+    o2_type: &str,
+    parent_id: &str,
+) -> bool {
+    if is_root_user(user_id) {
+        return true;
+    }
+    let Some(user) = crate::service::users::get_user(Some(org_id), user_id).await else {
+        return false;
+    };
+    check_permissions(
+        user_id,
+        AuthExtractor {
+            auth: String::new(),
+            method: method.to_string(),
+            o2_type: o2_type.to_string(),
+            org_id: org_id.to_string(),
+            bypass_check: false,
+            parent_id: parent_id.to_string(),
+            use_all_org: false,
+            use_self_context: false,
+            use_self_parent: false,
+        },
+        user.role,
+        user.is_external,
+    )
+    .await
 }
 
 #[cfg(feature = "enterprise")]
@@ -115,4 +163,53 @@ pub async fn list_objects_for_user(
     _object_type: &str,
 ) -> anyhow::Result<Option<Vec<String>>> {
     Ok(None)
+}
+
+#[cfg(all(test, not(feature = "enterprise")))]
+mod tests {
+    use super::*;
+
+    fn administrative_operation(method: &str, o2_type: &str) -> AuthExtractor {
+        AuthExtractor {
+            auth: String::new(),
+            method: method.to_string(),
+            o2_type: o2_type.to_string(),
+            org_id: "test-org".to_string(),
+            bypass_check: false,
+            parent_id: String::new(),
+            use_all_org: false,
+            use_self_context: false,
+            use_self_parent: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn community_service_accounts_cannot_perform_administrative_operations() {
+        let operations = [
+            ("POST", "enrichment_tables"),
+            ("GET", "users"),
+            ("DELETE", "streams"),
+            ("POST", "user_settings"),
+            ("DELETE", "user_settings"),
+            ("POST", "settings"),
+        ];
+
+        for (method, o2_type) in operations {
+            let operation = administrative_operation(method, o2_type);
+            assert!(
+                !check_permissions(
+                    "service-account@example.com",
+                    operation.clone(),
+                    UserRole::ServiceAccount,
+                    false,
+                )
+                .await,
+                "service account must be denied {method} {o2_type}"
+            );
+            assert!(
+                check_permissions("admin@example.com", operation, UserRole::Admin, false,).await,
+                "administrator must retain {method} {o2_type}"
+            );
+        }
+    }
 }

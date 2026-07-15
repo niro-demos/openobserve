@@ -405,8 +405,21 @@ pub async fn delete_fields(
 )]
 pub async fn delete(
     Path((org_id, stream_name)): Path<(String, String)>,
+    Headers(user_email): Headers<UserEmail>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if !crate::service::authz::authorize_admin_operation(
+        &org_id,
+        &user_email.user_id,
+        "DELETE",
+        "streams",
+        &stream_name,
+    )
+    .await
+    {
+        return MetaHttpResponse::forbidden("Unauthorized Access");
+    }
+
     let stream_type = get_stream_type_from_request(&query).unwrap_or_default();
     let del_related_feature_resources = query
         .get("delete_all")

@@ -96,6 +96,18 @@ pub async fn list(
     Headers(user_email): Headers<UserEmail>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if !crate::service::authz::authorize_admin_operation(
+        &org_id,
+        &user_email.user_id,
+        "GET",
+        "users",
+        &org_id,
+    )
+    .await
+    {
+        return MetaHttpResponse::forbidden("Admin or Root role required to list users");
+    }
+
     let list_all = match query.get("list_all") {
         Some(v) => v.parse::<bool>().unwrap_or(false),
         None => false,
