@@ -158,7 +158,21 @@ pub async fn get_org_by_id(pipeline_id: &str) -> Option<String> {
 /// Populates `PIPELINE_ID_TO_ORG` from the DB. Lightweight — does not initialize any
 /// `ExecutablePipeline` and is safe to call on every node type (routers included).
 pub async fn cache_id_to_org() -> Result<(), anyhow::Error> {
-    let pipelines = list().await?;
+    let mut pipelines = list().await?;
+    for pipeline in &mut pipelines {
+        if pipeline.enabled
+            && let Err(error) = pipeline.validate_stream_ownership()
+        {
+            log::error!(
+                "[Pipeline] disabling invalid cross-organization pipeline {}/{} before cache rebuild: {}",
+                pipeline.org,
+                pipeline.id,
+                error
+            );
+            pipeline.enabled = false;
+            infra_pipeline::put(pipeline).await?;
+        }
+    }
     let mut id_to_org = PIPELINE_ID_TO_ORG.write().await;
     id_to_org.clear();
     for pl in pipelines.iter() {
@@ -482,6 +496,18 @@ pub async fn watch() -> Result<(), anyhow::Error> {
                     .write()
                     .await
                     .insert(pipeline.id.clone(), pipeline.org.clone());
+                if let Err(error) = pipeline.validate_stream_ownership() {
+                    log::error!(
+                        "[Pipeline::watch] refusing to cache invalid cross-organization pipeline {}/{}/{}: {}",
+                        pipeline.org,
+                        pipeline.name,
+                        pipeline.id,
+                        error
+                    );
+                    remove_realtime_pipeline_cache(pipeline_id).await;
+                    SCHEDULED_PIPELINES.write().await.remove(pipeline_id);
+                    continue;
+                }
                 match &pipeline.source {
                     config::meta::pipeline::components::PipelineSource::Realtime(stream_params) => {
                         if pipeline.enabled {

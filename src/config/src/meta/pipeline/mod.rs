@@ -96,6 +96,34 @@ impl MemorySize for Pipeline {
 }
 
 impl Pipeline {
+    /// Ensures every local stream reference stays within the pipeline's organization.
+    pub fn validate_stream_ownership(&self) -> Result<()> {
+        if let PipelineSource::Realtime(stream) = &self.source
+            && stream.org_id != self.org
+        {
+            return Err(anyhow!(
+                "Pipeline source stream organization '{}' does not match pipeline organization '{}'",
+                stream.org_id,
+                self.org
+            ));
+        }
+
+        for node in &self.nodes {
+            if let NodeData::Stream(stream) = &node.data
+                && stream.org_id != self.org
+            {
+                return Err(anyhow!(
+                    "Pipeline stream node '{}' organization '{}' does not match pipeline organization '{}'",
+                    node.id,
+                    stream.org_id,
+                    self.org
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns true if this is a user-created pipeline.
     pub fn is_user(&self) -> bool {
         self.kind == PipelineKind::User
@@ -172,6 +200,8 @@ impl Pipeline {
             }
             _ => return Err(anyhow!("Source must be either a StreamNode or QueryNode")),
         };
+
+        self.validate_stream_ownership()?;
 
         for node in self.nodes.iter_mut() {
             // ck 4
@@ -485,6 +515,68 @@ pub fn default_status() -> bool {
 mod tests {
     use super::*;
     use crate::meta::alerts::{QueryCondition, TriggerCondition};
+
+    fn two_stream_pipeline(input_org: &str, output_org: &str) -> Pipeline {
+        Pipeline {
+            id: "test_pipeline".to_string(),
+            version: 1,
+            enabled: true,
+            org: "test_org".to_string(),
+            name: "test_pipeline".to_string(),
+            description: String::new(),
+            source: PipelineSource::Realtime(StreamParams::new(
+                input_org,
+                "input_stream",
+                StreamType::Logs,
+            )),
+            kind: PipelineKind::User,
+            nodes: vec![
+                Node::new(
+                    "input".to_string(),
+                    NodeData::Stream(StreamParams::new(
+                        input_org,
+                        "input_stream",
+                        StreamType::Logs,
+                    )),
+                    0.0,
+                    0.0,
+                    "input".to_string(),
+                ),
+                Node::new(
+                    "output".to_string(),
+                    NodeData::Stream(StreamParams::new(
+                        output_org,
+                        "output_stream",
+                        StreamType::Logs,
+                    )),
+                    0.0,
+                    100.0,
+                    "output".to_string(),
+                ),
+            ],
+            edges: vec![Edge::new("input".to_string(), "output".to_string())],
+        }
+    }
+
+    #[test]
+    fn test_pipeline_validation_rejects_foreign_stream_ownership() {
+        let mut same_org = two_stream_pipeline("test_org", "test_org");
+        assert!(
+            same_org.validate().is_ok(),
+            "same-org control must remain valid"
+        );
+
+        for (input_org, output_org) in [("foreign_org", "test_org"), ("test_org", "foreign_org")] {
+            let mut pipeline = two_stream_pipeline(input_org, output_org);
+            let error = pipeline
+                .validate()
+                .expect_err("foreign input and output streams must be rejected");
+            assert!(
+                error.to_string().contains("organization"),
+                "ownership error should explain the tenant boundary: {error}"
+            );
+        }
+    }
 
     #[test]
     fn test_pipeline_get_cache_key() {
